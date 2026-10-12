@@ -51,7 +51,7 @@ st.markdown("**Plateforme d'Analyse Statistique, Matrices de Corrélation, Courb
 
 # Sidebar : Configuration Backend API
 st.sidebar.header("⚙️ Configuration API FastAPI")
-API_URL = st.sidebar.text_input("Adresse du serveur FastAPI :", value="http://127.0.0.1:8000")
+API_URL = "https://phishingurl-app.onrender.com/"
 
 try:
     health = requests.get(f"{API_URL}/", timeout=2)
