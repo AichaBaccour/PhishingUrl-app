@@ -54,7 +54,7 @@ st.sidebar.header("⚙️ Configuration API FastAPI")
 API_URL = "https://phishingurl-app.onrender.com/"
 
 try:
-    response = requests.get(f"{API_URL}/", timeout=10)
+    response = requests.get(f"{API_URL}/", timeout=55)
     if response.status_code == 200:
         data = response.json()
         # Vérifie si le statut est "online" ou "ok"
