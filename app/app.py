@@ -54,14 +54,18 @@ st.sidebar.header("⚙️ Configuration API FastAPI")
 API_URL = "https://phishingurl-app.onrender.com/"
 
 try:
-    health = requests.get(f"{API_URL}/", timeout=2)
-    if health.status_code == 200:
-        st.sidebar.success("✅ FastAPI : Connecté")
+    response = requests.get(f"{API_URL}/", timeout=10)
+    if response.status_code == 200:
+        data = response.json()
+        # Vérifie si le statut est "online" ou "ok"
+        if data.get("status") in ["online", "ok"]:
+            st.success("🟢 FastAPI : Connecté")
+        else:
+            st.warning("⚠️ FastAPI : Statut Inattendu")
     else:
-        st.sidebar.warning("⚠️ FastAPI : Statut Inattendu")
-except Exception:
-    st.sidebar.error("❌ FastAPI : Déconnecté")
-
+        st.error("❌ FastAPI : Déconnecté")
+except Exception as e:
+    st.error(f"❌ FastAPI : Déconnecté ({e})")
 # ---------------------------------------------------------
 # NAVIGATION PAR ONGLETS
 # ---------------------------------------------------------
