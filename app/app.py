@@ -344,7 +344,7 @@ with tab8:
         'NoOfSelfRedirect': self_redirects
     }])
 
-    model_xai_choice = st.selectbox("Sélectionnez le modèle à expliquer :", ["XGBoost", "Random Forest", "Logistic Regression"])
+    model_xai_choice = st.selectbox("Sélectionnez le modèle à expliquer :", ["XGBoost", "Random Forest", "Logistic Regression", "DecisionTree", "KNN"])
 
     if st.button("📊 Générer l'Explication SHAP"):
         st.info(f"Analyse des contributions de caractéristiques pour le modèle {model_xai_choice}...")
@@ -362,9 +362,6 @@ with tab8:
         st.pyplot(fig_shap)
         st.caption("🔴 Rouge : Pousse vers la détection Phishing | 🔵 Bleu : Pousse vers la classification Légitime")
     def generate_shap_15_features_plot(model, input_15_features_df):
-    """
-    Génère l'explication SHAP ciblée sur les 15 variables retenues.
-    """
     try:
         # Utilisation de TreeExplainer pour les modèles basés sur des arbres (XGBoost, Random Forest, Decision Tree)
         explainer = shap.TreeExplainer(model)
