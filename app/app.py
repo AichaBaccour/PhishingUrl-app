@@ -361,3 +361,39 @@ with tab8:
         
         st.pyplot(fig_shap)
         st.caption("🔴 Rouge : Pousse vers la détection Phishing | 🔵 Bleu : Pousse vers la classification Légitime")
+    def generate_shap_15_features_plot(model, input_15_features_df):
+    """
+    Génère l'explication SHAP ciblée sur les 15 variables retenues.
+    """
+    try:
+        # Utilisation de TreeExplainer pour les modèles basés sur des arbres (XGBoost, Random Forest, Decision Tree)
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer(input_15_features_df)
+    except Exception:
+        # Fallback pour les modèles linéaires (Logistic Regression)
+        explainer = shap.Explainer(model.predict_proba, input_15_features_df)
+        shap_values = explainer(input_15_features_df)
+
+    # Récupération des valeurs SHAP pour la classe Phishing
+    if len(shap_values.shape) == 3:
+        vals = shap_values[0, :, 1].values
+    else:
+        vals = shap_values[0].values if hasattr(shap_values[0], 'values') else shap_values[0]
+
+    # Création du DataFrame d'impact pour les 15 features
+    impact_df = pd.DataFrame({
+        'Feature': input_15_features_df.columns,
+        'Valeur': input_15_features_df.iloc[0].values,
+        'Impact_SHAP': vals
+    }).sort_values(by='Impact_SHAP', key=abs, ascending=True)
+
+    # Affichage du graphique d'impact
+    fig, ax = plt.subplots(figsize=(8, 5))
+    colors = ['#e74c3c' if x > 0 else '#2ecc71' for x in impact_df['Impact_SHAP']]
+    
+    ax.barh(impact_df['Feature'], impact_df['Impact_SHAP'], color=colors)
+    ax.set_xlabel("Impact SHAP (Rouge = Phishing | Vert = Légitime)")
+    ax.set_title("Explicabilité XAI : Contribution des 15 Features")
+    
+    st.pyplot(fig)
+    return impact_df
