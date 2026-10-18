@@ -22,7 +22,7 @@ import scipy.sparse as sp
 import seaborn as sns
 import streamlit as st
 from sklearn.calibration import calibration_curve
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
@@ -34,8 +34,10 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
 )
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GridSearchCV, RandomizedSearchCV, StratifiedKFold, train_test_split
+from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.svm import SVC
 from sklearn.tree import DecisionTreeClassifier
 from ucimlrepo import fetch_ucirepo
 
@@ -72,9 +74,49 @@ RATIO_FEATURES = {
 }
 NAMES_GROUPED = FEATURES + ["TLD"]  # les colonnes one-hot du TLD sont regroupées pour SHAP
 COLORS = {"Phishing": "#e74c3c", "Légitime": "#2ecc71"}
-MODEL_CHOICES = ["Logistic Regression", "Decision Tree", "Random Forest"]
-if XGBClassifier is not None:
-    MODEL_CHOICES.append("XGBoost (réentraîné)")
+
+# Hyperparamètres réglables : "options" sert à la fois aux curseurs (mode manuel) et à l'espace de recherche
+PARAM_SPECS = {
+    "Logistic Regression": {
+        "C": {"options": [0.01, 0.1, 1.0, 10.0, 100.0], "default": 1.0},
+    },
+    "Decision Tree": {
+        "max_depth": {"options": [5, 10, 15, 20, 30], "default": 15},
+        "min_samples_leaf": {"options": [1, 2, 5, 10], "default": 1},
+    },
+    "Random Forest": {
+        "n_estimators": {"options": [50, 100, 200, 300], "default": 100},
+        "max_depth": {"options": [10, 15, 20, 30], "default": 20},
+        "min_samples_leaf": {"options": [1, 2, 5], "default": 1},
+    },
+    "XGBoost": {
+        "n_estimators": {"options": [50, 100, 200, 300], "default": 100},
+        "learning_rate": {"options": [0.03, 0.05, 0.1, 0.2, 0.3], "default": 0.1},
+        "max_depth": {"options": [3, 4, 6, 8, 10], "default": 6},
+        "subsample": {"options": [0.6, 0.8, 1.0], "default": 1.0},
+    },
+    "Gradient Boosting": {
+        "n_estimators": {"options": [50, 100, 150], "default": 100},
+        "learning_rate": {"options": [0.05, 0.1, 0.2], "default": 0.1},
+        "max_depth": {"options": [2, 3, 4, 5], "default": 3},
+    },
+    "Support Vector Machine": {
+        "C": {"options": [0.1, 1.0, 10.0], "default": 1.0},
+        "kernel": {"options": ["rbf", "linear"], "default": "rbf"},
+    },
+    "K-Nearest Neighbors": {
+        "n_neighbors": {"options": [3, 5, 7, 11, 15], "default": 5},
+        "weights": {"options": ["uniform", "distance"], "default": "uniform"},
+    },
+}
+if XGBClassifier is None:
+    PARAM_SPECS.pop("XGBoost")
+MODEL_CHOICES = list(PARAM_SPECS)
+# Modèles lents : plafond du nombre d'URLs d'entraînement
+CAPS = {"Support Vector Machine": 8_000, "K-Nearest Neighbors": 10_000, "Gradient Boosting": 30_000}
+SEARCH_ROWS = 20_000  # taille max de l'échantillon utilisé pour la recherche d'hyperparamètres
+SCORINGS = ["roc_auc", "average_precision", "f1", "recall", "precision", "accuracy"]
+TUNING_METHODS = ["Manuel", "Recherche aléatoire", "Recherche par grille"]
 
 
 # ---------------------------------------------------------------------
@@ -149,6 +191,7 @@ except Exception as exc:
     st.stop()
 
 Y_TEST = (P.y_test == 0).astype(int)  # 1 = phishing
+Y_TRAIN = (P.y_train == 0).astype(int)  # les nouveaux modèles sont entraînés avec 1 = phishing
 
 # ---------------------------------------------------------------------
 # ÉTAT DE SESSION
@@ -158,12 +201,16 @@ if "models" not in st.session_state:
     st.session_state.fit_times = {}
     st.session_state.probs = {}
     st.session_state.shap_cache = {}
+    st.session_state.params = {}
+    st.session_state.cv_tables = {}
+    st.session_state.last_sig = None
     if P.saved_model is not None:
         st.session_state.models[SAVED_NAME] = P.saved_model
 
 
 def phish_col(model):
-    return list(model.classes_).index(0)
+    """Colonne de predict_proba = phishing. Le modèle sauvegardé a phishing = 0 ; les modèles entraînés ici ont phishing = 1."""
+    return list(model.classes_).index(0 if model is P.saved_model else 1)
 
 
 def phish_proba(name):
@@ -214,20 +261,23 @@ def group_tld(vals):
 
 
 def compute_contributions(model, X_sparse):
-    """Retourne (contributions groupées [n, 16], valeur de base [n], unité)."""
+    """Retourne (contributions groupées [n, 16], valeur de base [n], unité) dans le sens phishing."""
+    sign = -1.0 if model is P.saved_model else 1.0  # le modèle sauvegardé a phishing = classe 0
+    n = X_sparse.shape[0]
     if XGBClassifier is not None and isinstance(model, XGBClassifier):
         contrib = model.get_booster().predict(xgb.DMatrix(X_sparse), pred_contribs=True)
-        return group_tld(-contrib[:, :-1]), -contrib[:, -1], "log-odds"
+        return group_tld(sign * contrib[:, :-1]), sign * contrib[:, -1], "log-odds"
+    if isinstance(model, (SVC, KNeighborsClassifier)):
+        raise ValueError("SHAP n'est pas disponible pour SVM et KNN : utilise l'importance par permutation du Laboratoire.")
 
     import shap
 
     dense = X_sparse.toarray()
     if isinstance(model, LogisticRegression):
-        background = P.X_train[:200].toarray()
-        explainer = shap.LinearExplainer(model, background)
-        sv = explainer.shap_values(dense)
+        explainer = shap.LinearExplainer(model, P.X_train[:200].toarray())
+        sv = np.asarray(explainer.shap_values(dense))
         base = float(np.ravel(explainer.expected_value)[0])
-        return group_tld(-np.asarray(sv)), np.full(len(dense), -base), "log-odds"
+        return group_tld(sign * sv), np.full(n, sign * base), "log-odds"
 
     explainer = shap.TreeExplainer(model)
     sv = explainer.shap_values(dense)
@@ -235,8 +285,33 @@ def compute_contributions(model, X_sparse):
         sv = sv[1]
     elif np.ndim(sv) == 3:
         sv = sv[:, :, 1]
+    sv = np.asarray(sv)
     base = float(np.ravel(explainer.expected_value)[-1])
-    return group_tld(-np.asarray(sv)), np.full(len(dense), 1 - base), "probabilité"
+    if isinstance(model, GradientBoostingClassifier):
+        return group_tld(sign * sv), np.full(n, sign * base), "log-odds"
+    return group_tld(sign * sv), np.full(n, base if sign > 0 else 1 - base), "probabilité"
+
+
+def permutation_importance(model, n_rows=2000, repeats=3):
+    """Importance par permutation (ROC-AUC) : fonctionne pour tous les modèles. Les colonnes du TLD sont permutées ensemble."""
+    rng = np.random.RandomState(RANDOM_STATE)
+    idx = rng.choice(P.X_test.shape[0], size=min(n_rows, P.X_test.shape[0]), replace=False)
+    Xd, y, col = P.X_test[idx].toarray(), Y_TEST[idx], phish_col(model)
+
+    def score(M):
+        return roc_auc_score(y, model.predict_proba(sp.csr_matrix(M))[:, col])
+
+    base = score(Xd)
+    groups = [[i] for i in range(len(FEATURES))] + [list(range(len(FEATURES), Xd.shape[1]))]
+    drops = []
+    for cols in groups:
+        d = []
+        for _ in range(repeats):
+            Xp = Xd.copy()
+            Xp[:, cols] = Xd[rng.permutation(len(Xd))][:, cols]
+            d.append(base - score(Xp))
+        drops.append(np.mean(d))
+    return pd.Series(drops, index=NAMES_GROUPED)
 
 
 def fmt(v):
@@ -306,30 +381,96 @@ def prefill_from_url():
 # ---------------------------------------------------------------------
 # ENTRAÎNEMENT
 # ---------------------------------------------------------------------
-def make_model(name):
+def make_model(name, params=None, inner_jobs=-1, for_search=False):
+    p = {k: spec["default"] for k, spec in PARAM_SPECS[name].items()}
+    p.update(params or {})
     if name == "Logistic Regression":
-        return LogisticRegression(C=1.0, max_iter=1000, random_state=RANDOM_STATE)
+        return LogisticRegression(max_iter=1000, random_state=RANDOM_STATE, **p)
     if name == "Decision Tree":
-        return DecisionTreeClassifier(max_depth=15, random_state=RANDOM_STATE)
+        return DecisionTreeClassifier(random_state=RANDOM_STATE, **p)
     if name == "Random Forest":
-        return RandomForestClassifier(n_estimators=100, max_depth=20, random_state=RANDOM_STATE, n_jobs=-1)
-    return XGBClassifier(n_estimators=100, learning_rate=0.1, random_state=RANDOM_STATE,
-                         eval_metric="logloss", n_jobs=-1)
+        return RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=inner_jobs, **p)
+    if name == "XGBoost":
+        return XGBClassifier(random_state=RANDOM_STATE, eval_metric="logloss", n_jobs=inner_jobs, **p)
+    if name == "Gradient Boosting":
+        return GradientBoostingClassifier(random_state=RANDOM_STATE, **p)
+    if name == "Support Vector Machine":
+        return SVC(probability=not for_search, random_state=RANDOM_STATE, **p)
+    return KNeighborsClassifier(**p)
 
 
-def train_models(selected, n_rows):
-    idx = np.random.RandomState(RANDOM_STATE).choice(P.X_train.shape[0], size=min(n_rows, P.X_train.shape[0]), replace=False)
-    Xs, ys = P.X_train[idx], P.y_train[idx]
+def sample_rows(name, n_rows, limit=None):
+    n = P.X_train.shape[0]
+    size = min(n_rows, n, CAPS.get(name, n))
+    if limit:
+        size = min(size, limit)
+    idx = np.random.RandomState(RANDOM_STATE).choice(n, size=size, replace=False)
+    return P.X_train[idx], Y_TRAIN[idx]
+
+
+def grid_size(name):
+    return int(np.prod([len(spec["options"]) for spec in PARAM_SPECS[name].values()]))
+
+
+def run_search(name, method, folds, scoring, n_iter, n_rows):
+    space = {k: spec["options"] for k, spec in PARAM_SPECS[name].items()}
+    cv = StratifiedKFold(folds, shuffle=True, random_state=RANDOM_STATE)
+    base = make_model(name, inner_jobs=1, for_search=True)
+    if method == TUNING_METHODS[2]:
+        search = GridSearchCV(base, space, scoring=scoring, cv=cv, n_jobs=-1)
+    else:
+        search = RandomizedSearchCV(base, space, n_iter=min(n_iter, grid_size(name)), scoring=scoring,
+                                    cv=cv, n_jobs=-1, random_state=RANDOM_STATE)
+    search.fit(*sample_rows(name, n_rows, limit=SEARCH_ROWS))
+    table = pd.DataFrame(search.cv_results_)[["params", "mean_test_score", "std_test_score", "rank_test_score"]]
+    table["params"] = table["params"].astype(str)
+    return search.best_params_, table.sort_values("rank_test_score")
+
+
+def train_models(selected, manual_params, method, folds, scoring, n_iter, n_rows):
     bar = st.progress(0.0, text="Entraînement...")
     for i, name in enumerate(selected):
-        bar.progress(i / len(selected), text=f"Entraînement : {name}...")
+        params = manual_params[name]
+        if method != TUNING_METHODS[0]:
+            bar.progress(i / len(selected), text=f"Recherche d'hyperparamètres : {name}...")
+            params, table = run_search(name, method, folds, scoring, n_iter, n_rows)
+            st.session_state.cv_tables[name] = table
+        else:
+            st.session_state.cv_tables.pop(name, None)
+        bar.progress(i / len(selected), text=f"Entraînement final : {name}...")
         t0 = time.time()
-        model = make_model(name).fit(Xs, ys)
+        model = make_model(name, params).fit(*sample_rows(name, n_rows))
         st.session_state.models[name] = model
+        st.session_state.params[name] = params
         st.session_state.fit_times[name] = round(time.time() - t0, 2)
         st.session_state.probs.pop(name, None)
         st.session_state.shap_cache.pop(name, None)
     bar.progress(1.0, text="Entraînement terminé ✅")
+
+
+@st.cache_data(show_spinner=False)
+def distribution_png(feature, show_kde, clip_extremes):
+    """Histogramme + boxplot d'une variable, par classe, rendu en PNG (mis en cache pour accélérer l'affichage)."""
+    df = P.sample
+    is_discrete = df[feature].nunique() <= 2
+    hist_df = df
+    if clip_extremes and not is_discrete:
+        lo, hi = df[feature].quantile([0.01, 0.99])
+        hist_df = df[(df[feature] >= lo) & (df[feature] <= hi)]
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(9.5, 3.3), gridspec_kw={"width_ratios": [3, 2]})
+    sns.histplot(data=hist_df, x=feature, hue="classe", palette=COLORS,
+                 discrete=is_discrete, multiple="dodge" if is_discrete else "layer",
+                 bins=40 if not is_discrete else "auto", kde=show_kde and not is_discrete, ax=a1)
+    if is_discrete:
+        a1.set_xticks(sorted(df[feature].dropna().unique()))
+    a1.set_title("Histogramme par classe" + (" (1er–99e percentile)" if clip_extremes and not is_discrete else ""), fontsize=10)
+    sns.boxplot(data=df, x="classe", y=feature, hue="classe", palette=COLORS, legend=False, ax=a2)
+    a2.set_title("Boxplot par classe", fontsize=10)
+    a2.set_xlabel("")
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")
+    plt.close(fig)
+    return buf.getvalue()
 
 
 # =====================================================================
@@ -346,21 +487,34 @@ elif P.saved_auc is not None and P.saved_auc < 0.95:
     st.warning(f"Le modèle sauvegardé obtient seulement un ROC-AUC de {P.saved_auc:.3f} sur le jeu de test : "
                "il ne correspond sans doute pas à ce prétraitement.")
 
-st.sidebar.header("⚙️ Paramètres")
-train_rows = st.sidebar.slider("Taille de l'échantillon d'entraînement (Laboratoire)", 10_000, int(P.X_train.shape[0]), 60_000, 10_000,
+st.sidebar.header("⚙️ Paramètres d'entraînement")
+train_rows = st.sidebar.slider("Taille de l'échantillon d'entraînement", 10_000, int(P.X_train.shape[0]), 60_000, 10_000,
                                help="Plus c'est grand, plus c'est précis mais plus c'est long.")
+tuning_method = st.sidebar.radio("Choix des hyperparamètres", TUNING_METHODS)
+cv_folds = st.sidebar.selectbox("Validation croisée (nombre de folds)", [3, 4, 5], index=0,
+                                disabled=(tuning_method == TUNING_METHODS[0]))
+scoring = st.sidebar.selectbox("Métrique de réglage", SCORINGS, index=0, disabled=(tuning_method == TUNING_METHODS[0]))
+n_iter = st.sidebar.slider("Itérations par modèle (recherche aléatoire)", 3, 30, 8,
+                           disabled=(tuning_method != TUNING_METHODS[1]))
+st.sidebar.caption("Changer ces paramètres demande de relancer l'entraînement dans le Laboratoire.")
 st.sidebar.divider()
 st.sidebar.subheader("🔌 API FastAPI (optionnel)")
-api_url = st.sidebar.text_input("URL de l'API", DEFAULT_API_URL).rstrip("/")
+api_url = st.sidebar.text_input("URL de l'API", DEFAULT_API_URL).strip().rstrip("/")
+if api_url.endswith("/docs"):
+    api_url = api_url[: -len("/docs")]
 if st.sidebar.button("Tester la connexion"):
     try:
-        r = requests.get(f"{api_url}/", timeout=60)
+        with st.sidebar.status("Connexion à l'API (jusqu'à 90 s si le serveur dort)...") as status:
+            r = requests.get(f"{api_url}/", timeout=90)
+            status.update(label="Réponse reçue", state="complete")
         if r.status_code == 200:
+            info = r.json()
             st.sidebar.success("🟢 API connectée")
+            st.sidebar.caption(f"Modèle chargé : {info.get('model_loaded')} — préprocesseur chargé : {info.get('preprocessor_loaded')}")
         else:
-            st.sidebar.error(f"❌ Code HTTP {r.status_code}")
-    except Exception:
-        st.sidebar.error("❌ API injoignable (serveur en veille ou URL incorrecte)")
+            st.sidebar.error(f"❌ Code HTTP {r.status_code} sur {api_url}/")
+    except Exception as exc:
+        st.sidebar.error(f"❌ API injoignable sur {api_url}/ : {type(exc).__name__} — {str(exc)[:200]}")
 st.sidebar.divider()
 buffer = io.BytesIO()
 joblib.dump({"scaler": P.scaler, "encoder": P.enc, "median": P.med, "top_tlds": P.top30, "features": FEATURES}, buffer)
@@ -419,17 +573,29 @@ with tabs[0]:
 # =====================================================================
 with tabs[1]:
     st.header("Exploration des variables")
-    feat = st.selectbox("Variable à analyser", FEATURES, key="eda_feat")
-    c1, c2 = st.columns(2)
-    with c1:
-        fig, ax = plt.subplots(figsize=(5, 3.5))
-        sns.histplot(data=P.sample, x=feat, hue="classe", palette=COLORS, bins=40, ax=ax)
-        ax.set_title("Distribution par classe (échantillon de 20 000 URLs)")
-        show(fig)
-    with c2:
-        fig, ax = plt.subplots(figsize=(5, 3.5))
-        sns.boxplot(data=P.sample, x="classe", y=feat, hue="classe", palette=COLORS, legend=False, ax=ax)
-        show(fig)
+    st.subheader("Distribution de chaque variable")
+    numeric_cols = [c for c in P.data.select_dtypes(include=[np.number]).columns if c != "label"]
+    chosen_vars = st.multiselect(
+        "Variables à afficher (par défaut : les 15 variables du modèle)", numeric_cols, default=FEATURES, key="eda_vars",
+        help="Tu peux ajouter ou retirer des variables, y compris celles qui ne sont pas utilisées par le modèle.")
+    o1, o2 = st.columns(2)
+    show_kde = o1.checkbox("Ajouter la courbe de densité (KDE)", value=False, key="eda_kde")
+    clip_extremes = o2.checkbox("Couper les valeurs extrêmes sur l'histogramme (1er–99e percentile)", value=True, key="eda_clip",
+                                help="Utile pour les variables très étirées comme URLLength : le boxplot, lui, montre toujours toutes les valeurs.")
+    st.caption("Calculé sur un échantillon aléatoire de 20 000 URLs. Les variables à seulement deux valeurs (0/1) sont affichées en barres.")
+
+    if not chosen_vars:
+        st.info("Choisis au moins une variable.")
+    else:
+        if len(chosen_vars) > 20:
+            st.info("Beaucoup de variables sélectionnées : le premier affichage peut prendre un moment, ensuite il est mis en cache.")
+        medians = P.sample.groupby("classe")[chosen_vars].median().T
+        medians["Écart (Phishing − Légitime)"] = medians["Phishing"] - medians["Légitime"]
+        with st.expander("Médiane de chaque variable par classe"):
+            st.dataframe(medians)
+        for var in chosen_vars:
+            st.markdown(f"**{var}**")
+            st.image(distribution_png(var, show_kde, clip_extremes))
 
     st.subheader("Corrélation entre les 15 variables")
     fig, ax = plt.subplots(figsize=(10, 5.5))
@@ -454,10 +620,40 @@ with tabs[1]:
 # =====================================================================
 with tabs[2]:
     st.header("Entraîner et comparer des modèles")
-    st.caption("Les modèles sont entraînés avec le même prétraitement que le notebook et évalués sur le même jeu de test (phishing = classe positive).")
-    chosen = st.multiselect("Modèles à entraîner", MODEL_CHOICES, default=[m for m in MODEL_CHOICES if m != "Random Forest"])
+    st.caption("Même prétraitement que le notebook, même jeu de test (phishing = classe positive). "
+               "Pour gagner du temps : SVM limité à 8 000 URLs, KNN à 10 000, Gradient Boosting à 30 000.")
+    chosen = st.multiselect("Modèles à entraîner", MODEL_CHOICES,
+                            default=[m for m in ["Logistic Regression", "Decision Tree", "XGBoost"] if m in MODEL_CHOICES])
+
+    manual_params = {}
+    for name in chosen:
+        specs = PARAM_SPECS[name]
+        manual_params[name] = {}
+        manual = tuning_method == TUNING_METHODS[0]
+        with st.expander(f"Hyperparamètres — {name}", expanded=manual):
+            if manual:
+                for col, (pname, spec) in zip(st.columns(len(specs)), specs.items()):
+                    with col:
+                        manual_params[name][pname] = st.select_slider(
+                            pname, options=spec["options"], value=spec["default"], key=f"hp_{name}_{pname}")
+            else:
+                st.write("Espace de recherche : " + " ; ".join(f"**{k}** ∈ {spec['options']}" for k, spec in specs.items()))
+                total = grid_size(name)
+                if tuning_method == TUNING_METHODS[2]:
+                    fits = total * cv_folds
+                    st.write(f"Grille complète : {total} combinaisons × {cv_folds} folds = **{fits} entraînements**.")
+                    if fits > 300:
+                        st.warning("Grille volumineuse : l'entraînement risque d'être long. Préfère la recherche aléatoire.")
+                else:
+                    st.write(f"Recherche aléatoire : {min(n_iter, total)} combinaisons parmi {total} × {cv_folds} folds, "
+                             f"métrique **{scoring}**.")
+
+    signature = repr((sorted(chosen), manual_params, tuning_method, cv_folds, scoring, n_iter, train_rows))
     if st.button("🚀 Entraîner", disabled=not chosen):
-        train_models(chosen, train_rows)
+        train_models(chosen, manual_params, tuning_method, cv_folds, scoring, n_iter, train_rows)
+        st.session_state.last_sig = signature
+    elif st.session_state.last_sig is not None and st.session_state.last_sig != signature:
+        st.warning("Les paramètres ont changé depuis le dernier entraînement : clique sur « Entraîner » pour mettre les résultats à jour.")
 
     if need_models():
         names = list(st.session_state.models)
@@ -472,6 +668,14 @@ with tabs[2]:
         table = pd.DataFrame(rows).set_index("Modèle").sort_values("F1", ascending=False)
         st.dataframe(table.style.format({c: "{:.4f}" for c in ["Accuracy", "Precision", "Recall", "F1", "ROC-AUC"]}, na_rep="—"))
         st.download_button("⬇️ Télécharger les métriques (CSV)", table.to_csv().encode("utf-8"), "metriques_modeles.csv", "text/csv")
+
+        if st.session_state.params:
+            st.subheader("Hyperparamètres utilisés")
+            st.dataframe(pd.DataFrame({"Modèle": list(st.session_state.params),
+                                       "Hyperparamètres": [str(v) for v in st.session_state.params.values()]}).set_index("Modèle"))
+        for n, tab in st.session_state.cv_tables.items():
+            with st.expander(f"Résultats de la recherche — {n}"):
+                st.dataframe(tab.set_index("rank_test_score"))
 
         st.subheader("Courbes ROC et Précision-Rappel")
         fig, (a1, a2) = plt.subplots(1, 2, figsize=(12, 4.5))
@@ -502,7 +706,8 @@ with tabs[2]:
             if hasattr(mdl, "feature_importances_"):
                 imp = pd.Series(mdl.feature_importances_, index=P.feat_names)
             elif hasattr(mdl, "coef_"):
-                imp = pd.Series(np.abs(mdl.coef_[0]), index=P.feat_names)
+                coef = mdl.coef_.toarray() if sp.issparse(mdl.coef_) else np.asarray(mdl.coef_)
+                imp = pd.Series(np.abs(coef[0]), index=P.feat_names)
             else:
                 imp = None
             if imp is not None:
@@ -518,6 +723,15 @@ with tabs[2]:
         ax.set(xlabel="Probabilité prédite de phishing", ylabel="Fréquence réelle", title="Calibration")
         ax.legend(fontsize=8)
         show(fig)
+
+        st.subheader("Importance par permutation (valable pour tous les modèles)")
+        if st.button("Calculer l'importance par permutation", key="perm_btn"):
+            with st.spinner("Calcul en cours (2 000 URLs de test)..."):
+                perm = permutation_importance(st.session_state.models[sel])
+            fig, ax = plt.subplots(figsize=(6, 4.5))
+            perm.sort_values().plot.barh(ax=ax, color="#9b59b6")
+            ax.set_xlabel("Baisse de ROC-AUC quand la variable est mélangée")
+            show(fig)
 
 # =====================================================================
 # 4. SEUIL DE DÉCISION
