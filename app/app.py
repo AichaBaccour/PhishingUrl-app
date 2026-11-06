@@ -448,6 +448,16 @@ def train_models(selected, manual_params, method, folds, scoring, n_iter, n_rows
     bar.progress(1.0, text="Entraînement terminé ✅")
 
 
+def kde_possible(df, feature, hue="classe"):
+    """La courbe KDE (gaussian_kde) exige au moins 2 valeurs différentes et une variance non nulle dans CHAQUE classe.
+    Sinon la matrice de covariance est singulière et SciPy lève LinAlgError."""
+    for _, g in df.groupby(hue):
+        x = g[feature].dropna().to_numpy(dtype=float)
+        if len(x) < 2 or np.unique(x).size < 2 or np.std(x) < 1e-9:
+            return False
+    return True
+
+
 @st.cache_data(show_spinner=False)
 def distribution_png(feature, show_kde, clip_extremes):
     """Histogramme + boxplot d'une variable, par classe, rendu en PNG (mis en cache pour accélérer l'affichage)."""
@@ -458,12 +468,25 @@ def distribution_png(feature, show_kde, clip_extremes):
         lo, hi = df[feature].quantile([0.01, 0.99])
         hist_df = df[(df[feature] >= lo) & (df[feature] <= hi)]
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(9.5, 3.3), gridspec_kw={"width_ratios": [3, 2]})
-    sns.histplot(data=hist_df, x=feature, hue="classe", palette=COLORS,
-                 discrete=is_discrete, multiple="dodge" if is_discrete else "layer",
-                 bins=40 if not is_discrete else "auto", kde=show_kde and not is_discrete, ax=a1)
+
+    # La KDE n'est activée que si elle est calculable pour chaque classe (sinon LinAlgError)
+    use_kde = show_kde and not is_discrete and kde_possible(hist_df, feature)
+    hist_kwargs = dict(data=hist_df, x=feature, hue="classe", palette=COLORS,
+                       discrete=is_discrete, multiple="dodge" if is_discrete else "layer",
+                       bins=40 if not is_discrete else "auto")
+    try:
+        sns.histplot(**hist_kwargs, kde=use_kde, ax=a1)
+    except np.linalg.LinAlgError:
+        # Filet de sécurité : variance quasi nulle, on trace sans la courbe
+        a1.clear()
+        sns.histplot(**hist_kwargs, kde=False, ax=a1)
+
     if is_discrete:
         a1.set_xticks(sorted(df[feature].dropna().unique()))
     a1.set_title("Histogramme par classe" + (" (1er–99e percentile)" if clip_extremes and not is_discrete else ""), fontsize=10)
+    if show_kde and not is_discrete and not use_kde:
+        a1.text(0.98, 0.95, "KDE indisponible\n(variance nulle dans une classe)", transform=a1.transAxes,
+                ha="right", va="top", fontsize=8, color="grey")
     sns.boxplot(data=df, x="classe", y=feature, hue="classe", palette=COLORS, legend=False, ax=a2)
     a2.set_title("Boxplot par classe", fontsize=10)
     a2.set_xlabel("")
