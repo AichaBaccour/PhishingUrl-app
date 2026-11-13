@@ -126,7 +126,8 @@ TUNING_METHODS = ["Manuel", "Recherche aléatoire", "Recherche par grille"]
 def load_pipeline():
     ds = fetch_ucirepo(id=967)
     X = ds.data.features
-    y = ds.data.targets.iloc[:, 0].astype(int)
+    y = ds.data.targets.iloc[:, 0].astype("int8")
+    del ds  # libère tout de suite le dataset brut (colonnes Title, Domain... inutiles ici)
 
     missing = [f for f in FEATURES if f not in X.columns]
     if missing:
@@ -134,6 +135,13 @@ def load_pipeline():
 
     num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
     X = X[["URL", "TLD"] + num_cols].copy()
+    # Économie de mémoire : float64 -> float32 et entiers réduits (l'appli tourne avec ~1 Go de RAM sur Streamlit Cloud)
+    for c in num_cols:
+        if pd.api.types.is_float_dtype(X[c]):
+            X[c] = X[c].astype("float32")
+        else:
+            X[c] = pd.to_numeric(X[c], downcast="integer")
+    X["TLD"] = X["TLD"].astype("category")
     n_missing = int(X.isna().sum().sum())
     n_dups = int(X.duplicated().sum())
 
@@ -143,16 +151,17 @@ def load_pipeline():
     )
     x_tr, x_te = x_tr.copy(), x_te.copy()
 
-    top30 = x_tr["TLD"].value_counts().head(30).index.tolist()
+    top30 = x_tr["TLD"].astype(str).value_counts().head(30).index.tolist()
     for part in (x_tr, x_te):
-        part["TLD_grouped"] = part["TLD"].where(part["TLD"].isin(top30), "Other")
+        tld_str = part["TLD"].astype(str)
+        part["TLD_grouped"] = tld_str.where(tld_str.isin(top30), "Other")
 
-    med = x_tr[FEATURES].median()
-    scaler = StandardScaler().fit(x_tr[FEATURES].fillna(med))
+    med = x_tr[FEATURES].median().astype(float)
+    scaler = StandardScaler().fit(x_tr[FEATURES].astype(float).fillna(med))
     enc = OneHotEncoder(handle_unknown="ignore", sparse_output=True).fit(x_tr[["TLD_grouped"]])
 
     def build(frame):
-        num = scaler.transform(frame[FEATURES].fillna(med))
+        num = scaler.transform(frame[FEATURES].astype(float).fillna(med))
         return sp.hstack((num, enc.transform(frame[["TLD_grouped"]])), format="csr")
 
     X_train, X_test = build(x_tr), build(x_te)
@@ -160,6 +169,7 @@ def load_pipeline():
 
     data = X.assign(label=y)
     data["classe"] = np.where(data["label"] == 0, "Phishing", "Légitime")
+    del X
 
     saved_model, saved_auc = None, None
     if MODEL_PATH.exists():
@@ -172,14 +182,26 @@ def load_pipeline():
         except Exception:
             saved_model = None
 
+    # On ne garde en mémoire que ce que les onglets utilisent vraiment (plus le dataset complet)
+    n_total = len(data)
+    n_phish = int((data["label"] == 0).sum())
+    preview = data[["URL", "TLD"] + FEATURES + ["classe"]].head(1000).copy()
+    numeric_cols = [c for c in num_cols if c != "label"]
+    corr15, corr_all = data[FEATURES].corr(), data[num_cols].corr()
+    sample = data.sample(min(20000, len(data)), random_state=RANDOM_STATE).copy()
+    tld_prob = y_tr.groupby(x_tr["TLD"].astype(str)).mean()
+    global_legit = float(y_tr.mean())
+    x_te = x_te[["URL", "TLD_grouped"] + FEATURES].copy()  # utilisé par SHAP et l'analyse des erreurs
+    del data, x_tr
+
     return SimpleNamespace(
-        data=data, sample=data.sample(min(20000, len(data)), random_state=RANDOM_STATE),
-        x_train=x_tr, x_test=x_te, y_train=y_tr.values, y_test=y_te.values,
+        n_total=n_total, n_phish=n_phish, preview=preview, numeric_cols=numeric_cols, sample=sample,
+        x_test=x_te, y_train=y_tr.values, y_test=y_te.values,
         X_train=X_train, X_test=X_test,
         feat_names=FEATURES + tld_names, top30=top30, med=med, scaler=scaler, enc=enc,
         build=build, n_missing=n_missing, n_dups=n_dups,
-        corr15=data[FEATURES].corr(), corr_all=data[num_cols].corr(),
-        tld_prob=y_tr.groupby(x_tr["TLD"]).mean(), global_legit=float(y_tr.mean()),
+        corr15=corr15, corr_all=corr_all,
+        tld_prob=tld_prob, global_legit=global_legit,
         saved_model=saved_model, saved_auc=saved_auc,
     )
 
@@ -554,8 +576,8 @@ tabs = st.tabs([
 # =====================================================================
 with tabs[0]:
     st.header("Aperçu du jeu de données")
-    n_total = len(P.data)
-    n_phish = int((P.data["label"] == 0).sum())
+    n_total = P.n_total
+    n_phish = P.n_phish
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("URLs au total", f"{n_total:,}")
     c2.metric("Phishing (0)", f"{n_phish:,} ({n_phish / n_total:.1%})")
@@ -563,7 +585,7 @@ with tabs[0]:
     c4.metric("Variables utilisées", f"{len(FEATURES)} + TLD")
 
     st.subheader("10 premières lignes")
-    st.dataframe(P.data[["URL", "TLD"] + FEATURES + ["classe"]].head(10))
+    st.dataframe(P.preview.head(10))
 
     left, right = st.columns(2)
     with left:
@@ -588,7 +610,7 @@ with tabs[0]:
         )
 
     st.download_button("⬇️ Télécharger un échantillon (1 000 lignes, CSV)",
-                       P.data[["URL", "TLD"] + FEATURES + ["classe"]].head(1000).to_csv(index=False).encode("utf-8"),
+                       P.preview.to_csv(index=False).encode("utf-8"),
                        "echantillon_phiusiil.csv", "text/csv")
 
 # =====================================================================
@@ -597,7 +619,7 @@ with tabs[0]:
 with tabs[1]:
     st.header("Exploration des variables")
     st.subheader("Distribution de chaque variable")
-    numeric_cols = [c for c in P.data.select_dtypes(include=[np.number]).columns if c != "label"]
+    numeric_cols = P.numeric_cols
     chosen_vars = st.multiselect(
         "Variables à afficher (par défaut : les 15 variables du modèle)", numeric_cols, default=FEATURES, key="eda_vars",
         help="Tu peux ajouter ou retirer des variables, y compris celles qui ne sont pas utilisées par le modèle.")
